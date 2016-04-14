@@ -301,7 +301,7 @@ func main() {
 		if run == 0 {
 			continue
 		}
-		fmt.Printf("%2v [%2.2f%%]: %v\n", run, float64(n)/float64(total)*100, strings.Repeat("*", int(float64(n)/float64(maxN)*100+0.5)))
+		fmt.Printf("%2v [%5.2f%%]: %v\n", run, float64(n)/float64(total)*100, strings.Repeat("*", int(float64(n)/float64(maxN)*100+0.5)))
 	}
 
 	p := &profile.Profile{
