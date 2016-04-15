@@ -7,8 +7,11 @@ import (
 	"encoding/binary"
 	"flag"
 	"fmt"
+	"io/ioutil"
 	"os"
 	"os/exec"
+	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
 
@@ -18,16 +21,19 @@ import (
 var (
 	flagInput    = flag.String("i", "perf.data", "input perf file")
 	flagOutput   = flag.String("o", "", "output perf file")
-	flagPid      = flag.Int("p", 0, "target pid")
+	flagPid      = flag.Int("p", 0, "target pid (default is pid with most samples)")
 	flagRealtime = flag.Bool("realtime", true, "scale samples to real time")
+	flagInit     = flag.Bool("init", true, "analyze program initialization (before the program spawns first thread)")
+	flagCpu      = flag.Int("cpu", 0, "select only samples happened during that load")
 )
 
 type Proc struct {
-	pid     int
-	n       int
-	run     int
-	load    map[int]int
-	samples map[uint64]*Sample
+	pid           int
+	n             int
+	run           int
+	multithreaded bool
+	load          map[int]int
+	samples       map[uint64]*Sample
 }
 
 type Sample struct {
@@ -46,6 +52,9 @@ type Frame struct {
 }
 
 func main() {
+	runtime.GOMAXPROCS(2)
+	debug.SetGCPercent(1000)
+
 	flag.Parse()
 
 	f, err := os.Create(*flagOutput)
@@ -54,8 +63,12 @@ func main() {
 	}
 	defer f.Close()
 
-	perf := exec.Command("perf", "script", "-i", *flagInput, "-f", "pid,tid,cpu,event,trace,ip,sym")
+	perf := exec.Command("perf", "script", "-i", *flagInput, "--fields", "pid,tid,cpu,event,trace,ip,sym", "--demangle", "--ns")
 	perfOut, err := perf.StdoutPipe()
+	if err != nil {
+		failf("failed to pipe perf output: %v", err)
+	}
+	perfOutErr, err := perf.StderrPipe()
 	if err != nil {
 		failf("failed to pipe perf output: %v", err)
 	}
@@ -85,6 +98,13 @@ func main() {
 				continue
 			}
 			if strings.Contains(ln, " sched:sched_switch:") {
+				/* The format is:
+				   0/0 [006] sched:sched_switch: prev_comm=swapper/6 prev_pid=0 prev_prio=120 prev_state=R ==> next_comm=rcuos/2 next_pid=11 next_prio=120
+				       ffffffff817297f0 __schedule
+				       ffffffff8172a109 schedule_preempt_disabled
+				       ffffffff810bf66e cpu_startup_entry
+				       ffffffff8104160d start_secondary
+				*/
 				i := 0
 				for ; ln[i] < '0' || ln[i] > '9'; i++ {
 				}
@@ -156,7 +176,28 @@ func main() {
 
 				p = getProc(int(npid))
 				p.run++
+				if p.run > 1 {
+					p.multithreaded = true
+				}
 			} else if strings.Contains(ln, " cycles:") {
+				/* The format is:
+				   0/0 [006] cycles:
+				       ffffffff8104f45a native_write_msr_safe
+				       ffffffff8102fa4c intel_pmu_enable_all
+				       ffffffff81029ca4 x86_pmu_enable
+				       ffffffff81143487 perf_pmu_enable
+				       ffffffff81027d8a x86_pmu_commit_txn
+				       ffffffff81143f00 group_sched_in
+				       ffffffff811443c2 __perf_event_enable
+				       ffffffff81140000 remote_function
+				       ffffffff810dcf60 generic_smp_call_function_single_interrupt
+				       ffffffff81040cd7 smp_call_function_single_interrupt
+				       ffffffff8173759d call_function_single_interrupt
+				       ffffffff815d6c59 cpuidle_idle_call
+				       ffffffff8101d3ee arch_cpu_idle
+				       ffffffff810bf4f5 cpu_startup_entry
+				       ffffffff8104160d start_secondary
+				*/
 				i := 0
 				for ; ln[i] < '0' || ln[i] > '9'; i++ {
 				}
@@ -186,12 +227,16 @@ func main() {
 					continue
 				}
 				p := getProc(int(pid))
-				if false && (p.run < 0 || p.run > 2) {
+				if !*flagInit && !p.multithreaded {
 					continue
 				}
-				p.load[p.run]++
+				run := p.run
+				if run == 0 {
+					run = 1 // somehow it happens
+				}
+				p.load[run]++
 				frames := parseStack(s)
-				frames = append(frames, &Frame{uint64(p.run), fmt.Sprintf("LOAD %v", p.run)})
+				frames = append(frames, &Frame{uint64(run), fmt.Sprintf("LOAD %v", run)})
 				stkHash := hashStack(frames)
 				stack := stacks[stkHash]
 				if stack == nil {
@@ -230,13 +275,13 @@ func main() {
 				sample := p.samples[stkHash]
 				if sample == nil {
 					sample = &Sample{
-						run:   p.run,
+						run:   run,
 						stack: stack,
 					}
 					p.samples[stkHash] = sample
 				}
-				if sample.run != p.run {
-					fmt.Fprintf(os.Stderr, "misaccounted sample: %v -> %v\n", p.run, sample.run)
+				if sample.run != run {
+					fmt.Fprintf(os.Stderr, "misaccounted sample: %v -> %v\n", run, sample.run)
 				}
 				sample.n++
 				p.n++
@@ -244,8 +289,14 @@ func main() {
 		}
 		done <- s.Err()
 	}()
-	if err := perf.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "warnings: perf failed: %v\n", err)
+	if err := perf.Start(); err != nil {
+		failf("failed to start perf: %v", err)
+	}
+	errOutput, _ := ioutil.ReadAll(perfOutErr)
+	if err := perf.Wait(); err != nil {
+		if false {
+			failf("perf failed: %v\n%s", err, errOutput)
+		}
 	}
 	if err := <-done; err != nil {
 		failf("failed to parse perf output: %v", err)
@@ -262,11 +313,6 @@ func main() {
 	for run := range proc.load {
 		if maxRun < run {
 			maxRun = run
-		}
-	}
-	for _, s := range proc.samples {
-		if s.run == 0 {
-			s.run = 1
 		}
 	}
 	if *flagRealtime {
@@ -315,6 +361,9 @@ func main() {
 	locs := make(map[uint64]bool)
 	funcs := make(map[uint64]bool)
 	for _, s := range proc.samples {
+		if *flagCpu > 0 && *flagCpu != s.run {
+			continue
+		}
 		p.Sample = append(p.Sample, &profile.Sample{
 			Value:    []int64{int64(s.n), int64(s.n) * p.Period},
 			Location: s.stack.frames,
@@ -356,9 +405,6 @@ func parseStack(s *bufio.Scanner) []*Frame {
 			break
 		}
 		fn := ln[i+1:]
-		if fn == "[unknown]" {
-			continue
-		}
 		frames = append(frames, &Frame{pc, fn})
 	}
 	return frames
