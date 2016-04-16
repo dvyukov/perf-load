@@ -13,6 +13,7 @@ If perf crashes during perf-load invocation, try to build tip perf:
 $ sudo apt-get install libunwind8-dev binutils-dev libdw-dev libelf-dev
 $ git clone git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git
 $ cd linux/tools/perf
+$ make
 ```
 Then add `linux/tools/perf` to `PATH`.
 
