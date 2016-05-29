@@ -20,6 +20,6 @@ Then add `linux/tools/perf` to `PATH`.
 To profile without sudo:
 
 ```
-$ sudo sh -c 'echo 1 >/proc/sys/kernel/perf_event_paranoid'
+$ sudo sh -c 'echo 0 >/proc/sys/kernel/perf_event_paranoid'
 $ sudo chmod a+rwx -R /sys/kernel/debug
 ```
